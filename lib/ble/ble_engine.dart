@@ -677,6 +677,8 @@ class _Session {
   Timer? keepAlive; // 30s: liveness watchdog + battery poll + realtime re-arm
   Timer? periodicBackfill; // 900s: re-trigger the historical offload
   Timer? idleWatchdog; // 60s: strap went silent mid-offload
+  Duration? idleDeadline; // engine-monotonic time, updated without rearming
+  int? idleWatchdogTaskGen;
   Timer? historicalRetry; // explicit abort→retry settle
   /// Armed once opcode 22 went out; ended by the band's first answer for that
   /// task (see [FirstStartWatchdogPolicy]). The idle watchdog only arms on
@@ -791,6 +793,13 @@ class _Session {
 
   _Session(this.device);
 
+  void cancelIdleWatchdog() {
+    idleWatchdog?.cancel();
+    idleWatchdog = null;
+    idleDeadline = null;
+    idleWatchdogTaskGen = null;
+  }
+
   void cancelFirstStartWatchdog() {
     firstStartWatchdog?.cancel();
     firstStartWatchdog = null;
@@ -803,8 +812,7 @@ class _Session {
     keepAlive = null;
     periodicBackfill?.cancel();
     periodicBackfill = null;
-    idleWatchdog?.cancel();
-    idleWatchdog = null;
+    cancelIdleWatchdog();
     historicalRetry?.cancel();
     historicalRetry = null;
     cancelFirstStartWatchdog();
@@ -3308,6 +3316,7 @@ class BleEngine {
   /// continuations) provably stale.
   int _claimHistoryTask(_Session session, {required bool drains}) {
     _drain?.startFreshTask();
+    session.cancelIdleWatchdog();
     if (drains) session.historyTaskEnded = false;
     _historyTaskGen++;
     _historyAwaitingFirstStart = drains;
@@ -3420,7 +3429,7 @@ class BleEngine {
       _historyRequestedGen = null;
       _historyAwaitingFirstStart = false;
       if (session.ownedTaskGen == taskGen) session.ownedTaskGen = null;
-      session.idleWatchdog?.cancel();
+      session.cancelIdleWatchdog();
       _setOffloadActive(false);
       _lastBackfillAt = floorBeforeInit;
       if (drainDeferred) {
@@ -4569,7 +4578,7 @@ class BleEngine {
       session.historyTaskEnded = endedBeforeClaim;
       _historyAwaitingFirstStart = false;
       session.ownedTaskGen = null;
-      session.idleWatchdog?.cancel();
+      session.cancelIdleWatchdog();
       _setOffloadActive(false);
       return false;
     }
@@ -4596,7 +4605,7 @@ class BleEngine {
       session.historyTaskEnded = endedBeforeClaim;
       _historyAwaitingFirstStart = false;
       session.ownedTaskGen = null;
-      session.idleWatchdog?.cancel();
+      session.cancelIdleWatchdog();
       _setOffloadActive(false);
       _armForeignRetrigger(session);
       return false;
@@ -4629,7 +4638,7 @@ class BleEngine {
         _historyRequestedGen = null;
         _historyAwaitingFirstStart = false;
         session.ownedTaskGen = null;
-        session.idleWatchdog?.cancel();
+        session.cancelIdleWatchdog();
         _setOffloadActive(false);
         if (withheld) _armForeignRetrigger(session);
       }
@@ -5654,9 +5663,9 @@ class BleEngine {
         // client's records among them must still be banked.
         _drainBatch = batch;
         _drainBatchNext = 0;
-        // Records are flowing → the strap is still draining. Armed per drained
-        // batch (bounded rate) instead of per record — same watchdog semantics,
-        // no Timer churn at flood rates. Markers re-arm it in _handleSyncMarker.
+        // Records are flowing → the strap is still draining. Update the idle
+        // deadline per drained batch; an already-armed timer is left alone.
+        // Markers update the same deadline in _handleSyncMarker.
         //
         // Only REAL drain progress counts: event/console count members ride
         // this queue too, and gen5's console chatter alone could otherwise
@@ -6562,41 +6571,67 @@ class BleEngine {
     }
   }
 
-  /// (Re)arm the 60s idle watchdog. Called on every offload frame (records +
-  /// markers). If the strap goes silent mid-offload, the open (un-ACKed) chunk is
-  /// abandoned so we never ACK a partial — the band re-delivers it next offload.
+  /// Record owned drain activity without cancelling/reallocating a timer for
+  /// every frame or batch. On expiry, the one pending timer checks the latest
+  /// monotonic deadline and sleeps only the remaining interval. A truly idle
+  /// task still discards its un-ACKed chunk and follows the existing retry path.
   void _armIdleWatchdog() {
-    // One choke point for all three callers: traffic of a transfer this
-    // engine did not request — or that arrived before our request went out —
-    // must never start the abort/retry machinery.
+    // Foreign/pre-request traffic must never start the abort/retry machinery.
     if (!_historyTaskOwned || _historyRequestedGen != _historyTaskGen) return;
     final session = _session;
-    if (session == null || !session.connected) return;
-    // A terminal task has nothing left to wait for: stragglers from it (the
-    // re-offered HISTORY_END above all) must not re-arm the watchdog and keep
-    // the ended task's retry machinery alive.
-    if (session.historyTaskEnded) return;
-    session.idleWatchdog?.cancel();
-    final armedGen = _historyTaskGen;
-    session.idleWatchdog = Timer(
-      const Duration(seconds: kBackfillIdleTimeoutSeconds),
-      () {
-        // Re-validated when it fires: the task it watched must still be the
-        // one we own and requested (a rolled-back claim gives up ownership
-        // without a generation bump).
-        if (_historyTaskGen != armedGen ||
-            !_historyTaskOwned ||
-            _historyRequestedGen != armedGen) {
-          return;
-        }
-        _log(
-          '[SYNC] idle watchdog: strap silent ${kBackfillIdleTimeoutSeconds}s '
-          'mid-offload — aborting historical sync and scheduling a retry.',
-        );
-        _drain?.discardOpenChunk();
-        unawaited(_abortAndRetryHistorical(reason: 'idle_watchdog'));
-      },
-    );
+    if (session == null || !session.connected || session.closing) return;
+    if (session.historyTaskEnded || session.historyStuckActive) return;
+    final taskGen = _historyTaskGen;
+    if (session.idleWatchdogTaskGen != taskGen) {
+      session.cancelIdleWatchdog();
+    }
+    const timeout = Duration(seconds: kBackfillIdleTimeoutSeconds);
+    session.idleWatchdogTaskGen = taskGen;
+    session.idleDeadline = _monotonic.elapsed + timeout;
+    if (session.idleWatchdog?.isActive ?? false) return;
+    _scheduleIdleWatchdog(session, taskGen, timeout);
+  }
+
+  void _scheduleIdleWatchdog(_Session session, int taskGen, Duration delay) {
+    // Native timers truncate to milliseconds. Round up so a fractional
+    // remainder cannot spin zero-delay checks before the deadline is reached.
+    const usPerMs = Duration.microsecondsPerMillisecond;
+    final roundedDelay = Duration(
+        milliseconds: (delay.inMicroseconds + usPerMs - 1) ~/ usPerMs);
+    late final Timer timer;
+    timer = Timer(roundedDelay, () {
+      // A stale callback must not clear a replacement task's timer/deadline.
+      if (!identical(session.idleWatchdog, timer)) return;
+      session.idleWatchdog = null;
+      // Ownership can be rolled back without a generation bump. Check both,
+      // plus the actual session and its terminal state, before touching a drain.
+      if (_sessionIsStale(session) ||
+          session.closing ||
+          session.historyTaskEnded ||
+          session.historyStuckActive ||
+          _historyTaskGen != taskGen ||
+          session.ownedTaskGen != taskGen ||
+          _historyRequestedGen != taskGen ||
+          session.idleWatchdogTaskGen != taskGen) {
+        session.cancelIdleWatchdog();
+        return;
+      }
+      final deadline = session.idleDeadline;
+      if (deadline == null) return;
+      final remaining = deadline - _monotonic.elapsed;
+      if (remaining > Duration.zero) {
+        _scheduleIdleWatchdog(session, taskGen, remaining);
+        return;
+      }
+      session.cancelIdleWatchdog();
+      _log(
+        '[SYNC] idle watchdog: strap silent ${kBackfillIdleTimeoutSeconds}s '
+        'mid-offload — aborting historical sync and scheduling a retry.',
+      );
+      _drain?.discardOpenChunk();
+      unawaited(_abortAndRetryHistorical(reason: 'idle_watchdog'));
+    });
+    session.idleWatchdog = timer;
   }
 
   /// The `beforeTransport` gate of task [taskGen]'s SEND_HISTORICAL_DATA:
@@ -6837,7 +6872,7 @@ class BleEngine {
     session.historyTaskEnded = true;
     session.ownTaskTail = true;
     // Nothing further is coming that may keep this task alive.
-    session.idleWatchdog?.cancel();
+    session.cancelIdleWatchdog();
     session.cancelFirstStartWatchdog();
     // The ended task's parked continuations (a commit mid-await, queued
     // frames, ACK retries) are stale from this moment.
@@ -6907,7 +6942,7 @@ class BleEngine {
   Future<void> _abortAndRetryHistorical({required String reason}) async {
     final session = _session;
     if (session == null || !session.connected) return;
-    session.idleWatchdog?.cancel();
+    session.cancelIdleWatchdog();
     session.historicalRetry?.cancel();
     session.cancelFirstStartWatchdog();
     // The drain ended on the clock, not on a HISTORY_COMPLETE — the boundary
@@ -7933,7 +7968,7 @@ class BleEngine {
       // answer. An auto-continue below re-claims through _claimHistoryTask.
       session.ownedTaskGen = null;
       _historyCompletions++;
-      _session?.idleWatchdog?.cancel();
+      _session?.cancelIdleWatchdog();
       _session?.cancelFirstStartWatchdog();
       await _bestEffortLedgerWrite(() => LocalDb.upsertSyncLedgerEntry(
         status: 'complete',

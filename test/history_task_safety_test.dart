@@ -289,6 +289,144 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   final ts = _wallNow() - 3600;
 
+  group('historical idle watchdog deadline', () {
+    test('ongoing records keep the same timer until its deadline check', () {
+      fakeAsync((async) {
+        final r = _Rig()..claim();
+        r.rx(_historyStart());
+        async.elapse(Duration.zero);
+        final first = async.pendingTimers.singleWhere(
+            (t) => t.duration == const Duration(seconds: 60));
+
+        // Repeated owned markers also reuse the same timer.
+        r.rx(_historyStart());
+        async.elapse(Duration.zero);
+        expect(first.isActive, isTrue);
+
+        // Each separately drained frame advances the deadline, not the timer.
+        for (var i = 1; i <= 45; i++) {
+          async.elapse(const Duration(seconds: 1));
+          r.rx(_gen5V18Inner(ts: ts + i, counter: 3000 + i));
+          async.elapse(Duration.zero);
+          expect(first.isActive, isTrue);
+          expect(async.pendingTimers.where(
+              (t) => t.duration == const Duration(seconds: 60)), [first]);
+        }
+        expect(r.aborts, isEmpty);
+
+        // The original check wakes at t=60, then waits only until t=105:
+        // sixty seconds after the last frame at t=45, not after the check.
+        async.elapse(const Duration(seconds: 15));
+        expect(first.isActive, isFalse);
+        final remaining = async.pendingTimers.singleWhere(
+            (t) => t.duration == const Duration(seconds: 45));
+        expect(remaining.isActive, isTrue);
+        expect(r.aborts, isEmpty);
+        async.elapse(const Duration(milliseconds: 44999));
+        expect(r.aborts, isEmpty);
+        async.elapse(const Duration(milliseconds: 1));
+        expect(r.aborts, hasLength(1));
+        expect(r.engine.offloadSnapshot['last_hps_reason'], 'idle_watchdog');
+      });
+    });
+
+    test('true inactivity aborts at 60 seconds and retains the retry path', () {
+      fakeAsync((async) {
+        final r = _Rig()..claim();
+        r.rx(_historyStart());
+        r.rx(_gen5V18Inner(ts: ts, counter: 3100));
+        async.elapse(Duration.zero);
+        expect(r.engine.debugDrain!.bufferedRecords, 1);
+        async.elapse(const Duration(milliseconds: 59999));
+        expect(r.aborts, isEmpty);
+        async.elapse(const Duration(milliseconds: 1));
+        expect(r.aborts, hasLength(1));
+        expect(r.successResults, isEmpty,
+            reason: 'an idle partial chunk is never ACKed');
+        expect(r.engine.debugDrain!.bufferedRecords, 0);
+        expect(r.engine.offloadSnapshot['last_hps_reason'], 'idle_watchdog');
+        async.elapse(const Duration(seconds: 5));
+        expect(r.drainRequests, hasLength(1),
+            reason: 'the existing abort-to-retry settle still requests history');
+        expect(r.aborts, hasLength(1));
+      });
+    });
+
+    test('a new task cancels the old deadline on the same session', () {
+      fakeAsync((async) {
+        final r = _Rig()..claim();
+        r.rx(_historyStart());
+        async.elapse(Duration.zero);
+        final oldTimer = async.pendingTimers.singleWhere(
+            (t) => t.duration == const Duration(seconds: 60));
+        async.elapse(const Duration(seconds: 30));
+        r.claim();
+        expect(oldTimer.isActive, isFalse);
+        r.rx(_historyStart());
+        async.elapse(Duration.zero);
+        async.elapse(const Duration(milliseconds: 59999));
+        expect(r.aborts, isEmpty,
+            reason: 'the old task deadline cannot expire the new task');
+        async.elapse(const Duration(milliseconds: 1));
+        expect(r.aborts, hasLength(1));
+      });
+    });
+
+    test('a dying session callback cannot abort its replacement', () {
+      fakeAsync((async) {
+        final r = _Rig()..claim();
+        r.rx(_historyStart());
+        async.elapse(Duration.zero);
+        async.elapse(const Duration(seconds: 30));
+        // The fake link deliberately leaves the old session timer pending,
+        // exercising the callback's session check, not teardown cancellation.
+        r.connect();
+        r.claim();
+        r.rx(_historyStart());
+        async.elapse(Duration.zero);
+        final replacementTimer = async.pendingTimers.lastWhere(
+            (t) => t.duration == const Duration(seconds: 60));
+        async.elapse(const Duration(seconds: 30));
+        expect(r.aborts, isEmpty);
+        expect(replacementTimer.isActive, isTrue,
+            reason: 'the stale callback must not touch the new session timer');
+        async.elapse(const Duration(milliseconds: 29999));
+        expect(r.aborts, isEmpty);
+        async.elapse(const Duration(milliseconds: 1));
+        expect(r.aborts, hasLength(1));
+      });
+    });
+
+    test('foreign traffic never arms an idle abort', () {
+      fakeAsync((async) {
+        final r = _Rig(); // no owned/requested task
+        r.rx(_historyStart());
+        r.rx(_gen5V18Inner(ts: ts, counter: 3200));
+        async.elapse(Duration.zero);
+        expect(async.pendingTimers.where(
+            (t) => t.duration == const Duration(seconds: 60)), isEmpty);
+        async.elapse(const Duration(seconds: 61));
+        expect(r.aborts, isEmpty);
+        expect(r.drainRequests, isEmpty);
+      });
+    });
+
+    test('completion cancels the idle deadline without a later abort', () {
+      fakeAsync((async) {
+        final r = _Rig()..claim();
+        r.rx(_historyStart());
+        async.elapse(Duration.zero);
+        final timer = async.pendingTimers.singleWhere(
+            (t) => t.duration == const Duration(seconds: 60));
+        r.rx(_historyComplete());
+        async.elapse(Duration.zero);
+        expect(timer.isActive, isFalse);
+        async.elapse(const Duration(seconds: 61));
+        expect(r.aborts, isEmpty);
+      });
+    });
+  });
+
   group('DrainController — the three lifecycle boundaries', () {
     DrainController drain() => DrainController(
           onRecord: (sample, raw) async {},
