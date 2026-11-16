@@ -33,6 +33,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -187,42 +188,127 @@ ColorFilter _themeFilter(Color bg, Color ink) {
 }
 
 Directory? _cacheDir;
+Future<Directory>? _cacheDirFuture;
+
+Future<Directory> _cacheDirectory() {
+  final current = _cacheDirFuture;
+  if (current != null) return current;
+
+  final flight = () async {
+    final dir = _cacheDir ??= Directory(
+      '${(await getTemporaryDirectory()).path}/osm_tiles',
+    );
+    await dir.create(recursive: true);
+    return dir;
+  }();
+  _cacheDirFuture = flight;
+  return flight;
+}
 
 Future<File?> _cacheFile(int z, int x, int y) async {
+  final pending = _cacheDirectory();
   try {
-    _cacheDir ??= Directory('${(await getTemporaryDirectory()).path}/osm_tiles')
-      ..createSync(recursive: true);
-    return File('${_cacheDir!.path}/${z}_${x}_$y.png');
+    final dir = await pending;
+    return File('${dir.path}/${z}_${x}_$y.png');
   } catch (_) {
-    // No cache directory is survivable — it means every card refetches, which
-    // is slower and ruder but still correct. It is not a reason to draw no map.
+    if (identical(_cacheDirFuture, pending)) _cacheDirFuture = null;
+    return null;
+  }
+}
+
+// Share encoded bytes only. Each mosaic owns and disposes its decoded images.
+// Flights end after persistence, so a late caller sees either this flight or
+// the complete cache file. Failures are evicted too, allowing a later retry.
+final _tileFlights = <(int, int, int), Future<Uint8List?>>{};
+final _cacheRandom = math.Random.secure();
+
+Future<bool> _validTileBytes(Uint8List bytes) async {
+  ui.Codec? codec;
+  try {
+    codec = await ui.instantiateImageCodec(bytes);
+    final frame = await codec.getNextFrame();
+    frame.image.dispose();
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    codec?.dispose();
+  }
+}
+
+Future<void> _cacheTileAtomically(File destination, Uint8List bytes) async {
+  // Unique siblings keep concurrent isolates/processes from sharing a staging
+  // file. Never delete the destination first: failed replacement preserves it.
+  final nonce = List.generate(4, (_) =>
+      _cacheRandom.nextInt(1 << 32).toRadixString(16)).join('-');
+  final temporary = File('${destination.path}.$pid.$nonce.tmp');
+  try {
+    await temporary.writeAsBytes(bytes, flush: true);
+    await temporary.rename(destination.path);
+  } finally {
+    // A killed process may leave a .tmp orphan, but readers only open .png.
+    try {
+      if (await temporary.exists()) await temporary.delete();
+    } catch (_) {/* cache cleanup is best-effort */}
+  }
+}
+
+Future<Uint8List?> _loadTileBytes(
+    int z, int x, int y, http.Client client) async {
+  final f = await _cacheFile(z, x, y);
+  try {
+    if (f != null && await f.exists()) {
+      final bytes = await f.readAsBytes();
+      if (bytes.isNotEmpty && await _validTileBytes(bytes)) return bytes;
+    }
+  } catch (_) {
+    if (f != null) _cacheDirFuture = null;
+    // Legacy partial entries or an evicted cache directory mean refetch.
+  }
+  try {
+    if (!mapTilesAllowed) return null;
+    final res = await client
+        .get(Uri.parse('https://tile.openstreetmap.org/$z/$x/$y.png'),
+            headers: const {'User-Agent': _userAgent})
+        .timeout(Motion.tick * 8);
+    final bytes = res.bodyBytes;
+    if (res.statusCode != 200 || bytes.isEmpty ||
+        !await _validTileBytes(bytes)) return null;
+    try {
+      if (f != null) await _cacheTileAtomically(f, bytes);
+    } catch (_) {
+      _cacheDirFuture = null; // Rendering still uses the downloaded bytes.
+    }
+    return bytes;
+  } catch (_) {
     return null;
   }
 }
 
 Future<ui.Image?> _tile(int z, int x, int y, http.Client client) async {
-  final f = await _cacheFile(z, x, y);
+  if (!mapTilesAllowed) return null;
+  final key = (z, x, y);
+  final flight = _tileFlights.putIfAbsent(
+      key, () => _loadTileBytes(z, x, y, client));
+  Uint8List? bytes;
   try {
-    if (f != null && f.existsSync() && f.lengthSync() > 0) {
-      return await decodeImageFromList(f.readAsBytesSync());
-    }
-  } catch (_) {
-    // A truncated cache entry (killed mid-write) is not fatal — refetch it.
+    bytes = await flight;
+  } finally {
+    if (identical(_tileFlights[key], flight)) _tileFlights.remove(key);
   }
+  if (bytes == null) return null;
   try {
-    final res = await client
-        .get(Uri.parse('https://tile.openstreetmap.org/$z/$x/$y.png'),
-            headers: const {'User-Agent': _userAgent})
-        .timeout(Motion.tick * 8);
-    if (res.statusCode != 200 || res.bodyBytes.isEmpty) return null;
-    try {
-      f?.writeAsBytesSync(res.bodyBytes);
-    } catch (_) {/* cache is best-effort */}
-    return await decodeImageFromList(res.bodyBytes);
+    return await decodeImageFromList(bytes);
   } catch (_) {
     return null;
   }
 }
+
+/// Exercises the production consent/cache/flight path with an injected client.
+/// The returned image belongs to the caller, just like each mosaic's tiles.
+@visibleForTesting
+Future<ui.Image?> loadMapTileForTesting(
+    int z, int x, int y, http.Client client) => _tile(z, x, y, client);
 
 /// Fetch a basemap that frames [geo], and project the route onto it.
 ///
